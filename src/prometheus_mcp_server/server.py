@@ -1291,6 +1291,58 @@ async def format_query(query: str) -> Dict[str, Any]:
         "is_same": formatted == query,
     }
 
+@_tool(
+    name=_tool_name("get_target_metadata"),
+    description="Get per-target metric metadata (type, help, unit) as reported by individual scrape targets. Disambiguates identically-named metrics from different exporters.",
+    annotations={
+        "title": "Get Target Metadata",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_target_metadata(
+    match_target: Optional[str] = None,
+    metric: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Get per-target metric metadata from Prometheus.
+
+    Args:
+        match_target: Label selector to filter targets (e.g. '{job="node"}')
+        metric: Metric name to filter on
+        limit: Maximum number of entries to return; must be positive
+
+    Returns:
+        Target metadata list with count
+    """
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive number")
+
+    logger.info("Retrieving target metadata", match_target=match_target, metric=metric, limit=limit)
+
+    params: Optional[Dict[str, Any]] = {}
+    if match_target is not None:
+        params["match_target"] = match_target
+    if metric is not None:
+        params["metric"] = metric
+    if limit is not None:
+        params["limit"] = limit
+    if not params:
+        params = None
+
+    data = make_prometheus_request("targets/metadata", params=params)
+
+    if not isinstance(data, list):
+        data = []
+
+    logger.info("Target metadata retrieved", count=len(data))
+    return {
+        "metadata": data,
+        "count": len(data),
+    }
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

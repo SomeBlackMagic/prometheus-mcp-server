@@ -9,6 +9,7 @@ from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
     get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars, format_query,
+    get_target_metadata,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -1027,3 +1028,77 @@ async def test_format_query_invalid_raises(mock_make_request):
     async with Client(mcp) as client:
         with pytest.raises(Exception, match="parse error"):
             await client.call_tool("format_query", {"query": "up{"})
+
+
+# --- Target metadata tool ---
+
+@pytest.mark.asyncio
+async def test_get_target_metadata_no_params(mock_make_request):
+    """Call without parameters returns all metadata with correct count."""
+    mock_make_request.return_value = [
+        {"target": {"instance": "localhost:9090", "job": "prometheus"}, "metric": "up", "type": "gauge", "help": "Up", "unit": ""},
+        {"target": {"instance": "localhost:9100", "job": "node"}, "metric": "node_cpu_seconds_total", "type": "counter", "help": "CPU", "unit": "seconds"},
+    ]
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_target_metadata", {})
+
+        mock_make_request.assert_called_once_with("targets/metadata", params=None)
+        assert result.data["count"] == 2
+        assert result.data["metadata"] == mock_make_request.return_value
+
+
+@pytest.mark.asyncio
+async def test_get_target_metadata_with_match_target(mock_make_request):
+    """Call with match_target forwards the parameter correctly."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        await client.call_tool("get_target_metadata", {"match_target": '{job="prometheus"}'})
+
+        mock_make_request.assert_called_once_with("targets/metadata", params={"match_target": '{job="prometheus"}'})
+
+
+@pytest.mark.asyncio
+async def test_get_target_metadata_with_metric(mock_make_request):
+    """Call with metric forwards the parameter correctly."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        await client.call_tool("get_target_metadata", {"metric": "up"})
+
+        mock_make_request.assert_called_once_with("targets/metadata", params={"metric": "up"})
+
+
+@pytest.mark.asyncio
+async def test_get_target_metadata_with_limit(mock_make_request):
+    """Call with limit forwards the parameter correctly."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        await client.call_tool("get_target_metadata", {"limit": 5})
+
+        mock_make_request.assert_called_once_with("targets/metadata", params={"limit": 5})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_limit", [0, -1])
+async def test_get_target_metadata_rejects_non_positive_limit(mock_make_request, bad_limit):
+    """limit=0 or limit=-1 raises ValueError before making a request."""
+    async with Client(mcp) as client:
+        with pytest.raises(Exception, match="positive"):
+            await client.call_tool("get_target_metadata", {"limit": bad_limit})
+
+        mock_make_request.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_target_metadata_empty_response(mock_make_request):
+    """Empty response from Prometheus returns count: 0."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_target_metadata", {"metric": "nonexistent"})
+
+        assert result.data["count"] == 0
+        assert result.data["metadata"] == []

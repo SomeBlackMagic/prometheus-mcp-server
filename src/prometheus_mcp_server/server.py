@@ -1207,6 +1207,59 @@ async def get_tsdb_stats(limit: Optional[int] = None) -> Dict[str, Any]:
     logger.info("TSDB stats retrieved")
     return data
 
+@_tool(
+    name=_tool_name("query_exemplars"),
+    description="Query exemplars: retrieve trace span references linked to metric samples (Prometheus 2.26+). Bridges metrics to distributed traces.",
+    annotations={
+        "title": "Query Exemplars",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def query_exemplars(
+    query: str,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Query exemplars from Prometheus.
+
+    Args:
+        query: PromQL selector expression (e.g. 'http_request_duration_seconds_bucket')
+        start: Start time as RFC 3339 or Unix timestamp
+        end: End time as RFC 3339 or Unix timestamp
+
+    Returns:
+        Exemplars data with series_count and exemplar_count
+    """
+    logger.info("Querying exemplars", query=query, start=start, end=end)
+
+    params: Dict[str, Any] = {"query": query}
+    if start is not None:
+        params["start"] = start
+    if end is not None:
+        params["end"] = end
+
+    try:
+        data = make_prometheus_request("query_exemplars", params=params)
+    except Exception:
+        logger.warning("Exemplars query failed (Prometheus may not support exemplars)", query=query)
+        data = []
+
+    if not isinstance(data, list):
+        data = []
+
+    series_count = len(data)
+    exemplar_count = sum(len(s.get("exemplars", [])) for s in data)
+
+    logger.info("Exemplars retrieved", series_count=series_count, exemplar_count=exemplar_count)
+    return {
+        "exemplars": data,
+        "series_count": series_count,
+        "exemplar_count": exemplar_count,
+    }
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

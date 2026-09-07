@@ -8,7 +8,7 @@ from fastmcp import Client
 from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
-    get_runtime_info, get_build_info, get_tsdb_stats,
+    get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -897,3 +897,82 @@ async def test_get_tsdb_stats_rejects_non_positive_limit(mock_make_request):
             await client.call_tool("get_tsdb_stats", {"limit": 0})
 
         mock_make_request.assert_not_called()
+
+
+# --- Exemplars tool ---
+
+@pytest.mark.asyncio
+async def test_query_exemplars_basic(mock_make_request):
+    """Test basic exemplar query returns expected structure with series_count and exemplar_count."""
+    mock_make_request.return_value = [
+        {
+            "seriesLabels": {"__name__": "http_request_duration_seconds_bucket", "le": "0.5"},
+            "exemplars": [
+                {"labels": {"traceID": "abc123"}, "value": "0.4", "timestamp": 1617898400.123},
+                {"labels": {"traceID": "def456"}, "value": "0.3", "timestamp": 1617898401.456},
+            ]
+        },
+        {
+            "seriesLabels": {"__name__": "http_request_duration_seconds_bucket", "le": "1.0"},
+            "exemplars": [
+                {"labels": {"traceID": "ghi789"}, "value": "0.8", "timestamp": 1617898402.789},
+            ]
+        }
+    ]
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("query_exemplars", {"query": "http_request_duration_seconds_bucket"})
+
+        mock_make_request.assert_called_once_with(
+            "query_exemplars", params={"query": "http_request_duration_seconds_bucket"}
+        )
+        assert result.data["series_count"] == 2
+        assert result.data["exemplar_count"] == 3
+        assert result.data["exemplars"] == mock_make_request.return_value
+
+
+@pytest.mark.asyncio
+async def test_query_exemplars_with_time_range(mock_make_request):
+    """Test query with start/end forwards the parameters correctly."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        await client.call_tool("query_exemplars", {
+            "query": "http_request_duration_seconds_bucket",
+            "start": "2023-01-01T00:00:00Z",
+            "end": "2023-01-01T01:00:00Z",
+        })
+
+        mock_make_request.assert_called_once_with(
+            "query_exemplars", params={
+                "query": "http_request_duration_seconds_bucket",
+                "start": "2023-01-01T00:00:00Z",
+                "end": "2023-01-01T01:00:00Z",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_query_exemplars_empty_response(mock_make_request):
+    """Test empty exemplar response returns exemplar_count: 0."""
+    mock_make_request.return_value = []
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("query_exemplars", {"query": "nonexistent_metric"})
+
+        assert result.data["series_count"] == 0
+        assert result.data["exemplar_count"] == 0
+        assert result.data["exemplars"] == []
+
+
+@pytest.mark.asyncio
+async def test_query_exemplars_graceful_404(mock_make_request):
+    """Test Prometheus returns 404 or empty list for versions without exemplar support."""
+    mock_make_request.side_effect = Exception("HTTP 404: Not Found")
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("query_exemplars", {"query": "some_metric"})
+
+        assert result.data["series_count"] == 0
+        assert result.data["exemplar_count"] == 0
+        assert result.data["exemplars"] == []

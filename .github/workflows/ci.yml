@@ -86,8 +86,8 @@ jobs:
       packages: write  # Required for pushing Docker images
 
     steps:
-#      - name: Checkout repository
-#        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 #
 #      - name: Download all the dists
 #        uses: actions/download-artifact@v4
@@ -150,8 +150,7 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
-#          file: Dockerfile
-#          context: .
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

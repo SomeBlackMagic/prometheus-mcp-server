@@ -9,7 +9,7 @@ from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
     get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars, format_query,
-    get_target_metadata,
+    get_target_metadata, get_alertmanagers,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -1102,3 +1102,57 @@ async def test_get_target_metadata_empty_response(mock_make_request):
 
         assert result.data["count"] == 0
         assert result.data["metadata"] == []
+
+
+# --- Alertmanagers tool ---
+
+@pytest.mark.asyncio
+async def test_get_alertmanagers(mock_make_request):
+    """Returns active and dropped alertmanagers with correct counts."""
+    mock_make_request.return_value = {
+        "activeAlertmanagers": [
+            {"url": "http://alertmanager-0:9093/api/v1/alerts"},
+            {"url": "http://alertmanager-1:9093/api/v1/alerts"},
+        ],
+        "droppedAlertmanagers": [
+            {"url": "http://alertmanager-old:9093/api/v1/alerts"},
+        ]
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_alertmanagers", {})
+
+        mock_make_request.assert_called_once_with("alertmanagers")
+        assert result.data["active_count"] == 2
+        assert result.data["dropped_count"] == 1
+        assert len(result.data["activeAlertmanagers"]) == 2
+        assert len(result.data["droppedAlertmanagers"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_alertmanagers_empty(mock_make_request):
+    """Empty response (no alertmanagers configured) returns both counts as 0."""
+    mock_make_request.return_value = {
+        "activeAlertmanagers": [],
+        "droppedAlertmanagers": [],
+    }
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_alertmanagers", {})
+
+        assert result.data["active_count"] == 0
+        assert result.data["dropped_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_alertmanagers_missing_keys(mock_make_request):
+    """Response missing one of the keys returns empty list for that key."""
+    mock_make_request.return_value = {}
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_alertmanagers", {})
+
+        assert result.data["activeAlertmanagers"] == []
+        assert result.data["droppedAlertmanagers"] == []
+        assert result.data["active_count"] == 0
+        assert result.data["dropped_count"] == 0

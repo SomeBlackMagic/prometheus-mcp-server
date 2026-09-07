@@ -1343,6 +1343,37 @@ async def get_target_metadata(
         "count": len(data),
     }
 
+@_tool(
+    name=_tool_name("get_alertmanagers"),
+    description="Get current Alertmanager discovery state: which Alertmanager instances Prometheus sends alerts to and whether they are reachable.",
+    annotations={
+        "title": "Get Alertmanagers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_alertmanagers() -> Dict[str, Any]:
+    """Get the current state of Prometheus alertmanager discovery.
+
+    Returns:
+        Active and dropped alertmanagers with counts
+    """
+    logger.info("Retrieving alertmanagers")
+    data = make_prometheus_request("alertmanagers")
+
+    active = data.get("activeAlertmanagers", []) if isinstance(data, dict) else []
+    dropped = data.get("droppedAlertmanagers", []) if isinstance(data, dict) else []
+
+    logger.info("Alertmanagers retrieved", active_count=len(active), dropped_count=len(dropped))
+    return {
+        "activeAlertmanagers": active,
+        "droppedAlertmanagers": dropped,
+        "active_count": len(active),
+        "dropped_count": len(dropped),
+    }
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

@@ -9,7 +9,7 @@ from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
     get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars, format_query,
-    get_target_metadata, get_alertmanagers, get_prometheus_config,
+    get_target_metadata, get_alertmanagers, get_prometheus_config, get_prometheus_flags,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -1193,3 +1193,48 @@ async def test_get_prometheus_config_empty(mock_make_request):
         result = await client.call_tool("get_prometheus_config", {})
 
         assert result.data["yaml"] == ""
+
+
+# --- Prometheus flags tool ---
+
+@pytest.mark.asyncio
+async def test_get_prometheus_flags(mock_make_request):
+    """Returns the flags dict with correct count."""
+    flags = {
+        "storage.tsdb.path": "/prometheus",
+        "storage.tsdb.retention.time": "15d",
+        "web.listen-address": "0.0.0.0:9090",
+    }
+    mock_make_request.return_value = flags
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_flags", {})
+
+        mock_make_request.assert_called_once_with("status/flags")
+        assert result.data["flags"] == flags
+        assert result.data["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_prometheus_flags_empty(mock_make_request):
+    """Empty flags dict returns count: 0."""
+    mock_make_request.return_value = {}
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_flags", {})
+
+        assert result.data["flags"] == {}
+        assert result.data["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_get_prometheus_flags_passthrough(mock_make_request):
+    """Verify the raw dict is passed through without modification."""
+    flags = {"web.enable-admin-api": "false", "query.timeout": "2m"}
+    mock_make_request.return_value = flags
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_flags", {})
+
+        assert result.data["flags"] is not flags  # different object after serialization
+        assert result.data["flags"] == flags

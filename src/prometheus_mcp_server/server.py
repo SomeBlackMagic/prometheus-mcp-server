@@ -1399,6 +1399,34 @@ async def get_prometheus_config() -> Dict[str, Any]:
     logger.info("Prometheus configuration retrieved")
     return {"yaml": yaml_str}
 
+@_tool(
+    name=_tool_name("get_prometheus_flags"),
+    description="Get the command-line flags Prometheus was started with: retention period, storage path, admin API status, listen address, and other operational settings.",
+    annotations={
+        "title": "Get Prometheus Flags",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_prometheus_flags() -> Dict[str, Any]:
+    """Get the command-line flags that Prometheus was started with.
+
+    Returns:
+        Flags dict with count
+    """
+    logger.info("Retrieving Prometheus flags")
+    data = make_prometheus_request("status/flags")
+
+    flags = data if isinstance(data, dict) else {}
+
+    logger.info("Prometheus flags retrieved", count=len(flags))
+    return {
+        "flags": flags,
+        "count": len(flags),
+    }
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

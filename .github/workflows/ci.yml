@@ -150,8 +150,8 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v7
         with:
-          file: Dockerfile
-          context: .
+#          file: Dockerfile
+#          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -173,22 +173,27 @@ def test_setup_environment_with_bad_mcp_config_port(mock_config):
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.sys.exit")
-def test_run_server_success(mock_exit, mock_run, mock_setup):
+@patch("prometheus_mcp_server.main.shutdown_event")
+def test_run_server_success(mock_shutdown_event, mock_exit, mock_run, mock_setup):
     """Test successful server run."""
     # Setup
     mock_setup.return_value = True
+    # Make shutdown_event.wait() return immediately
+    mock_shutdown_event.wait.return_value = None
+    mock_exit.side_effect = SystemExit(0)
 
-    # Execute
-    run_server()
+    # Execute - stdio transport uses threading, so sys.exit(0) is called
+    with pytest.raises(SystemExit):
+        run_server()
 
     # Verify
     mock_setup.assert_called_once()
-    mock_exit.assert_not_called()
 
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.sys.exit")
-def test_run_server_setup_failure(mock_exit, mock_run, mock_setup):
+@patch("prometheus_mcp_server.main.shutdown_event")
+def test_run_server_setup_failure(mock_shutdown_event, mock_exit, mock_run, mock_setup):
     """Test server run with setup failure."""
     # Setup
     mock_setup.return_value = False
@@ -222,16 +227,17 @@ def test_setup_environment_bearer_token_auth(mock_load_dotenv, mock_config):
     # Verify
     assert result is True
 
+@patch("prometheus_mcp_server.main.strict_header_asgi_middleware", return_value=None)
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.config")
-def test_run_server_http_transport(mock_config, mock_run, mock_setup):
+def test_run_server_http_transport(mock_config, mock_run, mock_setup, mock_middleware):
     """Test server run with HTTP transport."""
     # Setup
     mock_setup.return_value = True
     mock_config.mcp_server_config = MCPServerConfig(
         mcp_server_transport="http",
-        mcp_bind_host="localhost", 
+        mcp_bind_host="localhost",
         mcp_bind_port=8080
     )
 
@@ -241,10 +247,11 @@ def test_run_server_http_transport(mock_config, mock_run, mock_setup):
     # Verify
     mock_run.assert_called_once_with(transport="http", host="localhost", port=8080)
 
+@patch("prometheus_mcp_server.main.strict_header_asgi_middleware", return_value=None)
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.config")
-def test_run_server_sse_transport(mock_config, mock_run, mock_setup):
+def test_run_server_sse_transport(mock_config, mock_run, mock_setup, mock_middleware):
     """Test server run with SSE transport."""
     # Setup
     mock_setup.return_value = True
@@ -260,10 +267,11 @@ def test_run_server_sse_transport(mock_config, mock_run, mock_setup):
     # Verify
     mock_run.assert_called_once_with(transport="sse", host="0.0.0.0", port=9090)
 
+@patch("prometheus_mcp_server.main.strict_header_asgi_middleware", return_value=None)
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.config")
-def test_run_server_http_transport_stateless(mock_config, mock_run, mock_setup):
+def test_run_server_http_transport_stateless(mock_config, mock_run, mock_setup, mock_middleware):
     """Test server run with HTTP transport and stateless_http enabled."""
     mock_setup.return_value = True
     mock_config.mcp_server_config = MCPServerConfig(
@@ -277,10 +285,11 @@ def test_run_server_http_transport_stateless(mock_config, mock_run, mock_setup):
 
     mock_run.assert_called_once_with(transport="http", host="localhost", port=8080, stateless_http=True)
 
+@patch("prometheus_mcp_server.main.strict_header_asgi_middleware", return_value=None)
 @patch("prometheus_mcp_server.main.setup_environment")
 @patch("prometheus_mcp_server.main.mcp.run")
 @patch("prometheus_mcp_server.main.config")
-def test_run_server_http_transport_not_stateless(mock_config, mock_run, mock_setup):
+def test_run_server_http_transport_not_stateless(mock_config, mock_run, mock_setup, mock_middleware):
     """Test server run with HTTP transport and stateless_http disabled (default)."""
     mock_setup.return_value = True
     mock_config.mcp_server_config = MCPServerConfig(

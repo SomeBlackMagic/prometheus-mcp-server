@@ -1,8 +1,9 @@
 #!/usr/bin/env python
 
+import inspect
 import os
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Annotated, Any, Dict, List, Optional, Union
 from dataclasses import dataclass
 import time
 from datetime import datetime, timedelta
@@ -11,7 +12,10 @@ from enum import Enum
 import dotenv
 import requests
 from fastmcp import FastMCP, Context
+from pydantic import Field
 from prometheus_mcp_server.logging_config import get_logger
+from prometheus_mcp_server.spec2026.headers import is_safe_plain_ascii
+from prometheus_mcp_server.spec2026.otel import get_trace_headers
 
 dotenv.load_dotenv()
 
@@ -22,9 +26,38 @@ def _tool_name(name: str) -> str:
     """Build tool name with optional prefix."""
     return f"{TOOL_PREFIX}_{name}" if TOOL_PREFIX else name
 
+# Optional server-side tool allowlist. When PROMETHEUS_MCP_ENABLED_TOOLS is set
+# to a comma-separated list of tool base names (e.g.
+# "execute_query,list_metrics"), only those tools are registered. When unset or
+# empty, all tools are registered (backward compatible).
+_enabled_tools_raw = os.environ.get("PROMETHEUS_MCP_ENABLED_TOOLS", "").strip()
+ENABLED_TOOLS: Optional[set] = (
+    {name.strip().lower() for name in _enabled_tools_raw.split(",") if name.strip()}
+    if _enabled_tools_raw
+    else None
+)
+
+def _tool_enabled(name: str) -> bool:
+    """Return True when the given (unprefixed) tool name should be registered."""
+    return ENABLED_TOOLS is None or name.lower() in ENABLED_TOOLS
+
 # Include prefix in MCP server name if set
 mcp_name = f"Prometheus MCP ({TOOL_PREFIX})" if TOOL_PREFIX else "Prometheus MCP"
 mcp = FastMCP(mcp_name)
+
+def _tool(*, name: str, **kwargs):
+    """Conditional ``mcp.tool`` decorator that honours PROMETHEUS_MCP_ENABLED_TOOLS.
+
+    When the tool is disabled we return a no-op decorator so the underlying
+    coroutine is left undefined for the MCP server, effectively removing it
+    from the surface.
+    """
+    base_name = name[len(TOOL_PREFIX) + 1:] if TOOL_PREFIX and name.startswith(f"{TOOL_PREFIX}_") else name
+    if _tool_enabled(base_name):
+        return mcp.tool(name=name, **kwargs)
+    def _skip(func):
+        return func
+    return _skip
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -46,7 +79,7 @@ def clear_metrics_cache():
 logger = get_logger()
 
 # Health check tool for Docker containers and monitoring
-@mcp.tool(
+@_tool(
     name=_tool_name("health_check"),
     description="Health check endpoint for container monitoring and status verification",
     annotations={
@@ -155,6 +188,30 @@ class PrometheusConfig:
     custom_headers: Optional[Dict[str, str]] = None
     # Request timeout in seconds to prevent hanging requests (DDoS protection)
     request_timeout: int = 30
+    # MCP 2026-07-28 compatibility layer (see prometheus_mcp_server.spec2026)
+    spec_2026_enabled: bool = True
+    cache_ttl_ms: int = 300000
+    cache_scope: str = "public"
+    strict_headers: bool = False
+    allow_org_id_override: bool = False
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an integer environment variable without ever failing at import."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid integer environment variable, using default",
+            variable=name,
+            value=raw,
+            default=default,
+        )
+        return default
+
 
 config = PrometheusConfig(
     url=os.environ.get("PROMETHEUS_URL", ""),
@@ -174,6 +231,11 @@ config = PrometheusConfig(
     client_key=os.environ.get("PROMETHEUS_CLIENT_KEY", "") or None,
     custom_headers=json.loads(os.environ.get("PROMETHEUS_CUSTOM_HEADERS")) if os.environ.get("PROMETHEUS_CUSTOM_HEADERS") else None,
     request_timeout=int(os.environ.get("PROMETHEUS_REQUEST_TIMEOUT", "30")),
+    spec_2026_enabled=os.environ.get("PROMETHEUS_MCP_SPEC_2026", "True").lower() in ("true", "1", "yes"),
+    cache_ttl_ms=_env_int("PROMETHEUS_MCP_CACHE_TTL_MS", 300000),
+    cache_scope=os.environ.get("PROMETHEUS_MCP_CACHE_SCOPE", "public").lower(),
+    strict_headers=os.environ.get("PROMETHEUS_MCP_STRICT_HEADERS", "False").lower() in ("true", "1", "yes"),
+    allow_org_id_override=os.environ.get("PROMETHEUS_MCP_ALLOW_ORG_ID_OVERRIDE", "False").lower() in ("true", "1", "yes"),
 )
 
 def get_prometheus_auth():
@@ -184,7 +246,35 @@ def get_prometheus_auth():
         return requests.auth.HTTPBasicAuth(config.username, config.password)
     return None
 
-def make_prometheus_request(endpoint, params=None):
+def resolve_org_id(org_id: Optional[str]) -> Optional[str]:
+    """Decide which tenant id, if any, belongs on the outbound request.
+
+    An operator-configured ORG_ID always wins over a per-call value unless the
+    operator additionally set PROMETHEUS_MCP_ALLOW_ORG_ID_OVERRIDE.
+    """
+    configured = config.org_id or None
+    if not org_id:
+        return configured
+
+    if not isinstance(org_id, str) or not is_safe_plain_ascii(org_id):
+        logger.warning(
+            "Rejecting unsafe per-call org_id; falling back to the configured tenant",
+            org_id_type=type(org_id).__name__,
+        )
+        return configured
+
+    if configured and not config.allow_org_id_override:
+        logger.warning(
+            "Ignoring per-call org_id because ORG_ID is configured",
+            switch="PROMETHEUS_MCP_ALLOW_ORG_ID_OVERRIDE",
+        )
+        return configured
+
+    logger.info("Using per-call tenant for this Prometheus request", org_id=org_id)
+    return org_id
+
+
+def make_prometheus_request(endpoint, params=None, org_id=None):
     """Make a request to the Prometheus API with proper authentication and headers."""
     if not config.url:
         logger.error("Prometheus configuration missing", error="PROMETHEUS_URL not set")
@@ -201,9 +291,14 @@ def make_prometheus_request(endpoint, params=None):
         headers.update(auth)
         auth = None  # Clear auth for requests.get if it's already in headers
     
-    # Add OrgID header if specified
-    if config.org_id:
-        headers["X-Scope-OrgID"] = config.org_id
+    # Add OrgID header if specified. An operator-configured ORG_ID always wins
+    # over a per-call value unless the operator opted into overrides.
+    effective_org_id = resolve_org_id(org_id)
+    if effective_org_id:
+        headers["X-Scope-OrgID"] = effective_org_id
+
+    # W3C trace context from the incoming request's _meta (2026-07-28).
+    headers.update(get_trace_headers())
 
     if config.custom_headers:
         headers.update(config.custom_headers)
@@ -275,7 +370,27 @@ def get_cached_metrics() -> List[str]:
 # Note: Argument completions will be added when FastMCP supports the completion
 # capability. The get_cached_metrics() function above is ready for that integration.
 
-@mcp.tool(
+def _org_id_json_schema(schema: Dict[str, Any]) -> None:
+    """Attach the 2026-07-28 x-mcp-header annotation to the org_id property."""
+    schema.pop("anyOf", None)
+    schema.pop("default", None)
+    schema["type"] = "string"
+    schema["x-mcp-header"] = "Org-Id"
+
+
+OrgIdParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "Tenant id sent as X-Scope-OrgID. Ignored when the server has ORG_ID "
+            "configured, unless the operator enabled PROMETHEUS_MCP_ALLOW_ORG_ID_OVERRIDE"
+        ),
+        json_schema_extra=_org_id_json_schema,
+    ),
+]
+
+
+@_tool(
     name=_tool_name("execute_query"),
     description="Execute a PromQL instant query against Prometheus",
     annotations={
@@ -287,12 +402,13 @@ def get_cached_metrics() -> List[str]:
         "openWorldHint": True
     }
 )
-async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any]:
+async def execute_query(query: str, time: Optional[str] = None, org_id: OrgIdParam = "") -> Dict[str, Any]:
     """Execute an instant query against Prometheus.
 
     Args:
         query: PromQL query string
         time: Optional RFC3339 or Unix timestamp (default: current time)
+        org_id: Optional tenant id sent as X-Scope-OrgID for this call only.
 
     Returns:
         Query result with type (vector, matrix, scalar, string) and values
@@ -300,9 +416,10 @@ async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any
     params = {"query": query}
     if time:
         params["time"] = time
-    
-    logger.info("Executing instant query", query=query, time=time)
-    data = make_prometheus_request("query", params=params)
+
+    logger.info("Executing instant query", query=query, time=time, org_id=org_id)
+    tenant_kwargs = {"org_id": org_id} if org_id else {}
+    data = make_prometheus_request("query", params=params, **tenant_kwargs)
 
     result = {
         "resultType": data["resultType"],
@@ -328,7 +445,7 @@ async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any
 
     return result
 
-@mcp.tool(
+@_tool(
     name=_tool_name("execute_range_query"),
     description="Execute a PromQL range query with start time, end time, and step interval",
     annotations={
@@ -340,7 +457,7 @@ async def execute_query(query: str, time: Optional[str] = None) -> Dict[str, Any
         "openWorldHint": True
     }
 )
-async def execute_range_query(query: str, start: str, end: str, step: str, ctx: Context | None = None) -> Dict[str, Any]:
+async def execute_range_query(query: str, start: str, end: str, step: str, ctx: Context | None = None, org_id: OrgIdParam = "") -> Dict[str, Any]:
     """Execute a range query against Prometheus.
 
     Args:
@@ -359,13 +476,14 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
         "step": step
     }
 
-    logger.info("Executing range query", query=query, start=start, end=end, step=step)
+    logger.info("Executing range query", query=query, start=start, end=end, step=step, org_id=org_id)
 
     # Report progress if context available
     if ctx:
         await ctx.report_progress(progress=0, total=100, message="Initiating range query...")
 
-    data = make_prometheus_request("query_range", params=params)
+    tenant_kwargs = {"org_id": org_id} if org_id else {}
+    data = make_prometheus_request("query_range", params=params, **tenant_kwargs)
 
     # Report progress
     if ctx:
@@ -402,7 +520,7 @@ async def execute_range_query(query: str, start: str, end: str, step: str, ctx: 
 
     return result
 
-@mcp.tool(
+@_tool(
     name=_tool_name("list_metrics"),
     description="List all available metrics in Prometheus with optional pagination support",
     annotations={
@@ -543,7 +661,7 @@ def _metadata_matches_pattern(metric_name: str, entries: List[Dict[str, Any]], p
     return False
 
 
-@mcp.tool(
+@_tool(
     name=_tool_name("get_metric_metadata"),
     description=(
         "Get metadata (type, help, unit) for metrics. "
@@ -627,7 +745,7 @@ async def get_metric_metadata(
 
     return result
 
-@mcp.tool(
+@_tool(
     name=_tool_name("get_targets"),
     description="Get scrape targets, with state/pool filtering and optional pagination",
     annotations={
@@ -722,6 +840,596 @@ async def get_targets(
                 returned_dropped=len(dropped))
 
     return result
+
+@_tool(
+    name=_tool_name("list_alerts"),
+    description="Get all active alerts from Prometheus with their state, labels, and annotations",
+    annotations={
+        "title": "List Active Alerts",
+        "icon": "🚨",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def list_alerts() -> Dict[str, Any]:
+    """Get all currently active alerts from Prometheus.
+
+    Returns:
+        Dictionary containing:
+        - alerts: List of active alerts with labels, annotations, state, and activeAt
+        - alert_count: Number of active alerts
+    """
+    logger.info("Retrieving active alerts")
+    data = make_prometheus_request("alerts", params=None)
+
+    alerts = data.get("alerts", [])
+    result = {
+        "alerts": alerts,
+        "alert_count": len(alerts)
+    }
+
+    logger.info("Active alerts retrieved", alert_count=len(alerts))
+    return result
+
+@_tool(
+    name=_tool_name("list_rules"),
+    description="Get alerting and recording rules with their health, state, and evaluation info",
+    annotations={
+        "title": "List Alerting & Recording Rules",
+        "icon": "📜",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def list_rules(
+    type: Optional[str] = None,
+    rule_name: Optional[List[str]] = None,
+    rule_group: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Get alerting and recording rules currently loaded in Prometheus.
+
+    Args:
+        type: Optional rule type filter, either 'alert' or 'record'
+        rule_name: Optional list of rule names to filter by (forwarded to the server
+            on Prometheus >= 2.44 and re-applied client-side for older or
+            Prometheus-compatible backends that ignore the parameter)
+        rule_group: Optional list of rule group names to filter by (same fallback)
+
+    Returns:
+        Dictionary containing:
+        - groups: List of rule groups with their rules
+        - group_count: Number of rule groups returned
+    """
+    if type is not None and type not in ("alert", "record"):
+        raise ValueError(f"Invalid rule type: '{type}'. Must be 'alert' or 'record'.")
+
+    logger.info("Retrieving rules", type=type, rule_name=rule_name, rule_group=rule_group)
+
+    params: Dict[str, Any] = {}
+    if type:
+        params["type"] = type
+    if rule_name:
+        params["rule_name[]"] = rule_name
+    if rule_group:
+        params["rule_group[]"] = rule_group
+
+    data = make_prometheus_request("rules", params=params or None)
+
+    groups = data.get("groups", [])
+    # Prometheus < 2.44 and some compatible backends (Thanos, VictoriaMetrics) silently
+    # ignore rule_name[]/rule_group[], so re-apply the filters client-side.
+    if rule_group:
+        wanted_groups = set(rule_group)
+        groups = [g for g in groups if g.get("name") in wanted_groups]
+    if rule_name:
+        wanted_rules = set(rule_name)
+        groups = [
+            {**g, "rules": [r for r in g.get("rules", []) if r.get("name") in wanted_rules]}
+            for g in groups
+        ]
+        groups = [g for g in groups if g["rules"]]
+
+    result = {
+        "groups": groups,
+        "group_count": len(groups)
+    }
+
+    logger.info("Rules retrieved", group_count=len(groups))
+    return result
+
+@_tool(
+    name=_tool_name("list_label_names"),
+    description="List all label names, optionally restricted to series matching selectors and a time range",
+    annotations={
+        "title": "List Label Names",
+        "icon": "🏷️",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def list_label_names(
+    match: Optional[List[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Dict[str, Any]:
+    """List label names known to Prometheus.
+
+    Args:
+        match: Optional list of series selectors (e.g. ['up', 'node_cpu_seconds_total{job="node"}'])
+        start: Optional start time as RFC3339 or Unix timestamp
+        end: Optional end time as RFC3339 or Unix timestamp
+
+    Returns:
+        Dictionary containing:
+        - labels: List of label names
+        - count: Number of label names returned
+    """
+    logger.info("Listing label names", match=match, start=start, end=end)
+
+    params: Dict[str, Any] = {}
+    if match:
+        params["match[]"] = match
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+
+    data = make_prometheus_request("labels", params=params or None)
+
+    result = {
+        "labels": data,
+        "count": len(data)
+    }
+
+    logger.info("Label names retrieved", count=len(data))
+    return result
+
+def _is_legacy_label_rune(ch: str, index: int) -> bool:
+    """Check whether a character is valid in a classic Prometheus label name."""
+    return (
+        ch == "_"
+        or "a" <= ch <= "z"
+        or "A" <= ch <= "Z"
+        or (index > 0 and "0" <= ch <= "9")
+    )
+
+
+def _escape_label_name(name: str) -> str:
+    """Escape a label name for use in a URL path using Prometheus 'values' escaping.
+
+    Names valid under the classic charset ([a-zA-Z_][a-zA-Z0-9_]*) pass through
+    unchanged. UTF-8 names (legal since Prometheus 3.x) are escaped to the U__ form
+    the API requires for path segments.
+    """
+    if all(_is_legacy_label_rune(ch, i) for i, ch in enumerate(name)):
+        return name
+
+    escaped = ["U__"]
+    for index, ch in enumerate(name):
+        if ch == "_":
+            escaped.append("__")
+        elif _is_legacy_label_rune(ch, index):
+            escaped.append(ch)
+        else:
+            escaped.append(f"_{ord(ch):x}_")
+    return "".join(escaped)
+
+
+@_tool(
+    name=_tool_name("list_label_values"),
+    description="List all values for a label, optionally restricted to series matching selectors and a time range",
+    annotations={
+        "title": "List Label Values",
+        "icon": "🔤",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def list_label_values(
+    label_name: str,
+    match: Optional[List[str]] = None,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Dict[str, Any]:
+    """List values for a specific label name.
+
+    Args:
+        label_name: The label name to retrieve values for (e.g. 'job', 'instance')
+        match: Optional list of series selectors to restrict the values
+        start: Optional start time as RFC3339 or Unix timestamp
+        end: Optional end time as RFC3339 or Unix timestamp
+
+    Returns:
+        Dictionary containing:
+        - values: List of values for the label
+        - count: Number of values returned
+    """
+    if not label_name:
+        raise ValueError("label_name must not be empty")
+
+    logger.info("Listing label values", label_name=label_name, match=match, start=start, end=end)
+
+    params: Dict[str, Any] = {}
+    if match:
+        params["match[]"] = match
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+
+    data = make_prometheus_request(f"label/{_escape_label_name(label_name)}/values", params=params or None)
+
+    result = {
+        "values": data,
+        "count": len(data)
+    }
+
+    logger.info("Label values retrieved", label_name=label_name, count=len(data))
+    return result
+
+@_tool(
+    name=_tool_name("find_series"),
+    description="Find time series matching label selectors, with optional time range and result limit",
+    annotations={
+        "title": "Find Series",
+        "icon": "🔍",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def find_series(
+    match: List[str],
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Find time series by label matchers.
+
+    Args:
+        match: List of series selectors; at least one is required
+        start: Optional start time as RFC3339 or Unix timestamp
+        end: Optional end time as RFC3339 or Unix timestamp
+        limit: Maximum number of series to return; must be positive (default: all)
+
+    Returns:
+        Dictionary containing:
+        - series: List of label sets identifying matching series
+        - returned_count: Number of series returned
+        - has_more: Whether more series matched than were returned
+    """
+    if not match:
+        raise ValueError("find_series requires at least one series selector in 'match'")
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive number")
+
+    logger.info("Finding series", match=match, start=start, end=end, limit=limit)
+
+    params: Dict[str, Any] = {"match[]": match}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    if limit is not None:
+        params["limit"] = limit + 1
+
+    data = make_prometheus_request("series", params=params)
+
+    series = data[:limit] if limit is not None else data
+
+    result = {
+        "series": series,
+        "returned_count": len(series),
+        "has_more": len(series) < len(data)
+    }
+
+    logger.info("Series retrieved", returned_count=len(series), has_more=result["has_more"])
+    return result
+
+@_tool(
+    name=_tool_name("get_runtime_info"),
+    description="Get Prometheus runtime information such as start time, config reload status, goroutine count, and storage retention",
+    annotations={
+        "title": "Get Runtime Info",
+        "icon": "⚙️",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_runtime_info() -> Dict[str, Any]:
+    """Get runtime information about the Prometheus server."""
+    logger.info("Retrieving runtime info")
+    data = make_prometheus_request("status/runtimeinfo")
+
+    logger.info("Runtime info retrieved")
+    return data
+
+@_tool(
+    name=_tool_name("get_build_info"),
+    description="Get Prometheus build information such as version, revision, and Go version",
+    annotations={
+        "title": "Get Build Info",
+        "icon": "🏗️",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_build_info() -> Dict[str, Any]:
+    """Get build information about the Prometheus server."""
+    logger.info("Retrieving build info")
+    data = make_prometheus_request("status/buildinfo")
+
+    logger.info("Build info retrieved", version=data.get("version"))
+    return data
+
+@_tool(
+    name=_tool_name("get_tsdb_stats"),
+    description="Get TSDB cardinality statistics: head series counts and top metrics by series count",
+    annotations={
+        "title": "Get TSDB Stats",
+        "icon": "💾",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_tsdb_stats(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Get TSDB usage and cardinality statistics from Prometheus.
+
+    Args:
+        limit: Maximum number of items to return per stats list; must be positive (default: 10)
+
+    Returns:
+        TSDB statistics including head block stats and cardinality breakdowns
+    """
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be a positive number")
+
+    logger.info("Retrieving TSDB stats", limit=limit)
+
+    params = {"limit": limit} if limit is not None else None
+    data = make_prometheus_request("status/tsdb", params=params)
+
+    logger.info("TSDB stats retrieved")
+    return data
+
+# ---------------------------------------------------------------------------
+# MCP 2026-07-28 compatibility layer
+#
+# The installed mcp SDK implements 2025-11-25, so every 2026-07-28 behaviour is
+# added here on top of it (see prometheus_mcp_server.spec2026). Everything below
+# is additive and switched off wholesale by PROMETHEUS_MCP_SPEC_2026=false.
+# ---------------------------------------------------------------------------
+
+SERVER_VERSION = "1.6.2"
+
+from prometheus_mcp_server.spec2026.asgi import (
+    strict_header_middleware,
+    tool_annotation_lookup,
+)
+from prometheus_mcp_server.spec2026.discovery import install_discovery
+from prometheus_mcp_server.spec2026.envelope import (
+    _WRAPPER_MARKER as _ENVELOPE_WRAPPER_MARKER,
+    _get_request_handlers,
+    install_envelope,
+    install_initialize_envelope,
+)
+from prometheus_mcp_server.spec2026.negotiation import (
+    NegotiationError,
+    extract_request_meta,
+    negotiation_from_meta,
+    reset_current_negotiation,
+    set_current_negotiation,
+)
+from prometheus_mcp_server.spec2026.otel import (
+    extract_trace_headers,
+    reset_trace_headers,
+    set_trace_headers,
+)
+
+try:
+    from mcp.server.lowlevel.server import request_ctx as _sdk_request_ctx
+except Exception as e:  # pragma: no cover
+    logger.warning(
+        "MCP SDK request context unavailable; request _meta will not be read",
+        error=str(e),
+        error_type=type(e).__name__,
+    )
+    _sdk_request_ctx = None
+
+
+def _current_request_meta() -> Any:
+    """Read the raw _meta of the request currently being served."""
+    if _sdk_request_ctx is None:
+        return None
+    try:
+        return getattr(_sdk_request_ctx.get(), "meta", None)
+    except LookupError:
+        return None
+    except Exception as e:
+        logger.warning(
+            "Could not read the SDK request context",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return None
+
+
+_NEGOTIATION_WRAPPER_MARKER = "_spec2026_negotiation_inner"
+_SPEC_2026_WRAPPER_MARKERS = (_ENVELOPE_WRAPPER_MARKER, _NEGOTIATION_WRAPPER_MARKER)
+
+
+def _unwrap_spec_2026_handler(handler: Any) -> Any:
+    """Strip every 2026-07-28 wrapper off a low-level request handler."""
+    while True:
+        for marker in _SPEC_2026_WRAPPER_MARKERS:
+            inner = getattr(handler, marker, None)
+            if inner is not None:
+                handler = inner
+                break
+        else:
+            return handler
+
+
+def _wrap_negotiation(handler: Any) -> Any:
+    """Build the per-request negotiation wrapper around a low-level handler."""
+
+    async def negotiation_handler(req: Any = None) -> Any:
+        meta = extract_request_meta({"_meta": _current_request_meta()})
+
+        try:
+            negotiation = negotiation_from_meta(meta)
+        except NegotiationError as e:
+            logger.warning(
+                "Rejecting request after failed protocol negotiation",
+                code=e.code,
+                error=e.message,
+            )
+            raise e.to_mcp_error() from e
+
+        negotiation_token = set_current_negotiation(negotiation)
+        trace_token = set_trace_headers(extract_trace_headers(meta))
+        try:
+            result = handler(req)
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        finally:
+            reset_current_negotiation(negotiation_token)
+            reset_trace_headers(trace_token)
+
+    setattr(negotiation_handler, _NEGOTIATION_WRAPPER_MARKER, handler)
+    return negotiation_handler
+
+
+def install_negotiation(server: Any = None) -> bool:
+    """Wrap a FastMCP server's request handlers with per-request negotiation."""
+    try:
+        handlers = _get_request_handlers(server if server is not None else mcp)
+        if handlers is None:
+            return False
+
+        wrapped_count = 0
+        for request_type in list(handlers.keys()):
+            inner = _unwrap_spec_2026_handler(handlers[request_type])
+            if not callable(inner):
+                logger.warning(
+                    "Skipping non-callable request handler",
+                    request_type=getattr(request_type, "__name__", repr(request_type)),
+                )
+                continue
+            handlers[request_type] = _wrap_negotiation(inner)
+            wrapped_count += 1
+
+        if wrapped_count == 0:
+            logger.warning("Negotiation wrapped no request handlers; layer inactive")
+            return False
+
+        logger.info("MCP 2026-07-28 negotiation installed", handler_count=wrapped_count)
+        return True
+
+    except Exception as e:
+        logger.warning(
+            "Per-request negotiation unavailable; server continues on 2025-11-25",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return False
+
+
+async def tool_header_annotations(tool_name: Any) -> List[Any]:
+    """Collect the x-mcp-header annotations declared by a tool's input schema."""
+    if not isinstance(tool_name, str):
+        return []
+    return await tool_annotation_lookup(mcp, tool_name)
+
+
+def strict_header_asgi_middleware() -> Any:
+    """Build the ASGI middleware enforcing the Mcp-* header rules."""
+    if not config.strict_headers:
+        return None
+    try:
+        return strict_header_middleware(annotation_lookup=tool_header_annotations)
+    except Exception as e:
+        logger.warning(
+            "Strict header validation unavailable; requests will not be checked",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+        return None
+
+
+def install_spec_2026() -> Dict[str, Any]:
+    """Install the MCP 2026-07-28 compatibility layer onto this module's server."""
+    status: Dict[str, Any] = {
+        "negotiation": False,
+        "discovery": {},
+        "envelope": False,
+        "initialize_envelope": False,
+    }
+
+    try:
+        status["discovery"] = install_discovery(
+            mcp,
+            mcp_name,
+            SERVER_VERSION,
+            tool_namer=_tool_name,
+            cache_scope=config.cache_scope,
+        )
+
+        status["negotiation"] = install_negotiation(mcp)
+
+        status["envelope"] = install_envelope(
+            mcp,
+            server_name=mcp_name,
+            server_version=SERVER_VERSION,
+            ttl_ms=config.cache_ttl_ms,
+            cache_scope=config.cache_scope,
+        )
+
+        status["initialize_envelope"] = install_initialize_envelope(
+            server_name=mcp_name,
+            server_version=SERVER_VERSION,
+        )
+
+        logger.info(
+            "MCP 2026-07-28 compatibility layer installed",
+            strict_headers=config.strict_headers,
+            **status,
+        )
+    except Exception as e:
+        logger.warning(
+            "MCP 2026-07-28 compatibility layer unavailable; server continues on 2025-11-25",
+            error=str(e),
+            error_type=type(e).__name__,
+        )
+
+    return status
+
+
+if config.spec_2026_enabled:
+    SPEC_2026_STATUS = install_spec_2026()
+else:
+    SPEC_2026_STATUS = {}
+    logger.info(
+        "MCP 2026-07-28 compatibility layer disabled",
+        switch="PROMETHEUS_MCP_SPEC_2026",
+    )
+
 
 if __name__ == "__main__":
     logger.info("Starting Prometheus MCP Server", mode="direct")

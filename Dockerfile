@@ -53,6 +53,8 @@ USER app
 
 EXPOSE 8080
 
+STOPSIGNAL SIGTERM
+
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD if [ "$PROMETHEUS_MCP_SERVER_TRANSPORT" = "http" ] || [ "$PROMETHEUS_MCP_SERVER_TRANSPORT" = "sse" ]; then \
             curl -f http://localhost:${PROMETHEUS_MCP_BIND_PORT}/health >/dev/null 2>&1 || exit 1; \

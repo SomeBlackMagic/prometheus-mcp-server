@@ -1,11 +1,27 @@
 #!/usr/bin/env python
+import signal
 import sys
+import threading
 import dotenv
-from prometheus_mcp_server.server import mcp, config, TransportType
+from prometheus_mcp_server.server import (
+    mcp,
+    config,
+    strict_header_asgi_middleware,
+    TransportType,
+)
 from prometheus_mcp_server.logging_config import setup_logging
 
 # Initialize structured logging
 logger = setup_logging()
+
+# Global shutdown event for graceful Docker shutdown
+shutdown_event = threading.Event()
+
+def signal_handler(signum, frame):
+    """Handle SIGTERM and SIGINT signals for graceful shutdown."""
+    signal_name = signal.Signals(signum).name
+    logger.info("Received shutdown signal", signal=signal_name)
+    shutdown_event.set()
 
 def setup_environment():
     if dotenv.load_dotenv():
@@ -64,20 +80,26 @@ def setup_environment():
 
 def run_server():
     """Main entry point for the Prometheus MCP Server"""
+    # Setup signal handlers for graceful Docker shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
     # Setup environment
     if not setup_environment():
         logger.error("Environment setup failed, exiting")
         sys.exit(1)
-    
+
     mcp_config = config.mcp_server_config
     transport = mcp_config.mcp_server_transport
 
     http_transports = [TransportType.HTTP.value, TransportType.SSE.value]
     if transport in http_transports:
+        asgi_middleware = strict_header_asgi_middleware()
         mcp.run(
             transport=transport,
             host=mcp_config.mcp_bind_host,
             port=mcp_config.mcp_bind_port,
+            **({"middleware": [asgi_middleware]} if asgi_middleware else {}),
             **({"stateless_http": True} if mcp_config.stateless_http else {})
         )
         logger.info("Starting Prometheus MCP Server",
@@ -86,8 +108,19 @@ def run_server():
                 port=mcp_config.mcp_bind_port,
                 stateless_http=mcp_config.stateless_http)
     else:
-        mcp.run(transport=transport)
         logger.info("Starting Prometheus MCP Server", transport=transport)
+        # Run stdio transport in a thread so signal handlers can trigger graceful shutdown
+        server_thread = threading.Thread(target=lambda: mcp.run(transport=transport))
+        server_thread.daemon = True
+        server_thread.start()
+        try:
+            shutdown_event.wait()
+            logger.info("Shutdown initiated, stopping server gracefully")
+        except KeyboardInterrupt:
+            logger.info("Keyboard interrupt received, stopping server")
+        finally:
+            logger.info("Server shutdown complete")
+            sys.exit(0)
 
 if __name__ == "__main__":
     run_server()

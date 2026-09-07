@@ -1260,6 +1260,37 @@ async def query_exemplars(
         "exemplar_count": exemplar_count,
     }
 
+@_tool(
+    name=_tool_name("format_query"),
+    description="Validate and pretty-print a PromQL expression. Use this to verify syntax before executing a query.",
+    annotations={
+        "title": "Format Query",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def format_query(query: str) -> Dict[str, Any]:
+    """Validate and pretty-print a PromQL expression.
+
+    Args:
+        query: The PromQL expression to format/validate
+
+    Returns:
+        Formatted query with original for comparison
+    """
+    logger.info("Formatting query", query=query)
+
+    formatted = make_prometheus_request("format_query", params={"query": query})
+
+    logger.info("Query formatted", formatted=formatted)
+    return {
+        "formatted_query": formatted,
+        "original_query": query,
+        "is_same": formatted == query,
+    }
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

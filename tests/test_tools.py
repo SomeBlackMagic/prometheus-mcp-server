@@ -8,7 +8,7 @@ from fastmcp import Client
 from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
-    get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars,
+    get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars, format_query,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -976,3 +976,54 @@ async def test_query_exemplars_graceful_404(mock_make_request):
         assert result.data["series_count"] == 0
         assert result.data["exemplar_count"] == 0
         assert result.data["exemplars"] == []
+
+
+# --- Format query tool ---
+
+@pytest.mark.asyncio
+async def test_format_query_valid(mock_make_request):
+    """Test a valid query returns the formatted expression."""
+    mock_make_request.return_value = 'up{job="prometheus"}'
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("format_query", {"query": 'up{job="prometheus"}'})
+
+        mock_make_request.assert_called_once_with("format_query", params={"query": 'up{job="prometheus"}'})
+        assert result.data["formatted_query"] == 'up{job="prometheus"}'
+        assert result.data["original_query"] == 'up{job="prometheus"}'
+        assert result.data["is_same"] is True
+
+
+@pytest.mark.asyncio
+async def test_format_query_reformatted(mock_make_request):
+    """Test a query with extra whitespace returns a cleaned version with is_same=False."""
+    mock_make_request.return_value = 'up{job="prometheus"}'
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("format_query", {"query": '  up { job = "prometheus" } '})
+
+        mock_make_request.assert_called_once_with("format_query", params={"query": '  up { job = "prometheus" } '})
+        assert result.data["formatted_query"] == 'up{job="prometheus"}'
+        assert result.data["original_query"] == '  up { job = "prometheus" } '
+        assert result.data["is_same"] is False
+
+
+@pytest.mark.asyncio
+async def test_format_query_already_canonical(mock_make_request):
+    """Test an already-canonical query returns is_same=True."""
+    mock_make_request.return_value = "rate(http_requests_total[5m])"
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("format_query", {"query": "rate(http_requests_total[5m])"})
+
+        assert result.data["is_same"] is True
+
+
+@pytest.mark.asyncio
+async def test_format_query_invalid_raises(mock_make_request):
+    """Test an invalid PromQL expression raises ValueError with a descriptive error."""
+    mock_make_request.side_effect = ValueError("Prometheus API error: 1:6: parse error: unexpected end of input")
+
+    async with Client(mcp) as client:
+        with pytest.raises(Exception, match="parse error"):
+            await client.call_tool("format_query", {"query": "up{"})

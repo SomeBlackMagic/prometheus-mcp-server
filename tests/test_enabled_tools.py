@@ -49,7 +49,7 @@ def test_all_tools_registered_by_default(clean_env):
     assert "get_targets" in names
     assert "list_alerts" in names
     assert "server_discover" in names
-    assert len(names) == 16
+    assert len(names) == 17
 
 
 def test_enabled_tools_allowlist_filters_registry(clean_env):
@@ -106,4 +106,4 @@ def test_empty_enabled_tools_falls_back_to_all_tools(clean_env):
     server = _reload_server()
 
     assert server.ENABLED_TOOLS is None
-    assert len(_registered_tool_names(server)) == 16
+    assert len(_registered_tool_names(server)) == 17

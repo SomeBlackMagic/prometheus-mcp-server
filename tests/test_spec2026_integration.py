@@ -8,7 +8,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastmcp import Client
-from mcp.shared.exceptions import McpError
+try:
+    from mcp.shared.exceptions import McpError
+except ImportError:
+    from mcp.shared.exceptions import MCPError as McpError
 
 import prometheus_mcp_server.server as server
 from prometheus_mcp_server.server import (

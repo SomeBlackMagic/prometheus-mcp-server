@@ -296,7 +296,10 @@ def _retype_error(error: Exception, method: Optional[str]) -> Exception:
         return error
 
     try:
-        from mcp.shared.exceptions import McpError
+        try:
+            from mcp.shared.exceptions import McpError
+        except ImportError:
+            from mcp.shared.exceptions import MCPError as McpError
         from mcp.types import ErrorData
 
         if not isinstance(error, McpError):

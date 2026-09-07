@@ -78,7 +78,10 @@ class NegotiationError(Exception):
             otherwise this exception itself.
         """
         try:
-            from mcp.shared.exceptions import McpError
+            try:
+                from mcp.shared.exceptions import McpError
+            except ImportError:
+                from mcp.shared.exceptions import MCPError as McpError
             from mcp.types import ErrorData
 
             return McpError(ErrorData(code=self.code, message=self.message, data=self.data))

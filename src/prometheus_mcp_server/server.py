@@ -791,6 +791,12 @@ async def get_targets(
         applied, since the whole payload is parsed first. Pass state="any" or
         "dropped" explicitly when you need them, ideally with scrape_pool.
     """
+    state_aliases = {
+        "up": "active",
+        "down": "dropped",
+        "all": "any",
+    }
+    state = state_aliases.get(state, state)
     valid_states = ("active", "dropped", "any")
     if state not in valid_states:
         raise ValueError(f"Invalid state '{state}'. Must be one of: {', '.join(valid_states)}")

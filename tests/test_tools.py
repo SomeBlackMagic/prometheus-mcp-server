@@ -9,7 +9,7 @@ from prometheus_mcp_server.server import (
     mcp, execute_query, execute_range_query, list_metrics, get_metric_metadata, get_targets,
     list_alerts, list_rules, list_label_names, list_label_values, find_series,
     get_runtime_info, get_build_info, get_tsdb_stats, query_exemplars, format_query,
-    get_target_metadata, get_alertmanagers,
+    get_target_metadata, get_alertmanagers, get_prometheus_config,
     _metrics_cache, clear_metrics_cache,
     _coerce_metadata_entries, _normalize_metadata_map, _metadata_matches_pattern,
     _is_legacy_label_rune, _escape_label_name,
@@ -1156,3 +1156,40 @@ async def test_get_alertmanagers_missing_keys(mock_make_request):
         assert result.data["droppedAlertmanagers"] == []
         assert result.data["active_count"] == 0
         assert result.data["dropped_count"] == 0
+
+
+# --- Prometheus config tool ---
+
+@pytest.mark.asyncio
+async def test_get_prometheus_config(mock_make_request):
+    """Returns the YAML string from Prometheus as-is."""
+    yaml_str = "global:\n  scrape_interval: 15s\nscrape_configs:\n  - job_name: prometheus\n"
+    mock_make_request.return_value = {"yaml": yaml_str}
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_config", {})
+
+        mock_make_request.assert_called_once_with("status/config")
+        assert result.data["yaml"] == yaml_str
+
+
+@pytest.mark.asyncio
+async def test_get_prometheus_config_is_string(mock_make_request):
+    """Verify the response is a dict with a yaml key containing a string."""
+    mock_make_request.return_value = {"yaml": "global: {}"}
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_config", {})
+
+        assert isinstance(result.data["yaml"], str)
+
+
+@pytest.mark.asyncio
+async def test_get_prometheus_config_empty(mock_make_request):
+    """Empty/minimal YAML config is handled without errors."""
+    mock_make_request.return_value = {"yaml": ""}
+
+    async with Client(mcp) as client:
+        result = await client.call_tool("get_prometheus_config", {})
+
+        assert result.data["yaml"] == ""

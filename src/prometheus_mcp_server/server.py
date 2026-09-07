@@ -1374,6 +1374,31 @@ async def get_alertmanagers() -> Dict[str, Any]:
         "dropped_count": len(dropped),
     }
 
+@_tool(
+    name=_tool_name("get_prometheus_config"),
+    description="Get the currently loaded Prometheus configuration as YAML. Note: output may contain sensitive data depending on Prometheus version (secrets redacted by default since v2.19).",
+    annotations={
+        "title": "Get Prometheus Config",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_prometheus_config() -> Dict[str, Any]:
+    """Get the currently loaded Prometheus configuration.
+
+    Returns:
+        Raw YAML configuration string
+    """
+    logger.info("Retrieving Prometheus configuration")
+    data = make_prometheus_request("status/config")
+
+    yaml_str = data.get("yaml", "") if isinstance(data, dict) else ""
+
+    logger.info("Prometheus configuration retrieved")
+    return {"yaml": yaml_str}
+
 # ---------------------------------------------------------------------------
 # MCP 2026-07-28 compatibility layer
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+import logging
 import signal
 import sys
 import threading
@@ -13,6 +14,17 @@ from prometheus_mcp_server.logging_config import setup_logging
 
 # Initialize structured logging
 logger = setup_logging()
+
+
+class _ShutdownCancelledFilter(logging.Filter):
+    """Suppress noisy CancelledError tracebacks from uvicorn during shutdown."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.exc_info and record.exc_info[1] is not None:
+            import asyncio
+            if isinstance(record.exc_info[1], asyncio.CancelledError):
+                return False
+        return True
 
 # Global shutdown event for graceful Docker shutdown
 shutdown_event = threading.Event()
@@ -94,19 +106,23 @@ def run_server():
 
     http_transports = [TransportType.HTTP.value, TransportType.SSE.value]
     if transport in http_transports:
+        # Suppress noisy CancelledError tracebacks during graceful shutdown
+        logging.getLogger("uvicorn.error").addFilter(_ShutdownCancelledFilter())
+
         asgi_middleware = strict_header_asgi_middleware()
-        mcp.run(
-            transport=transport,
-            host=mcp_config.mcp_bind_host,
-            port=mcp_config.mcp_bind_port,
-            **({"middleware": [asgi_middleware]} if asgi_middleware else {}),
-            **({"stateless_http": True} if mcp_config.stateless_http else {})
-        )
         logger.info("Starting Prometheus MCP Server",
                 transport=transport,
                 host=mcp_config.mcp_bind_host,
                 port=mcp_config.mcp_bind_port,
                 stateless_http=mcp_config.stateless_http)
+        mcp.run(
+            transport=transport,
+            host=mcp_config.mcp_bind_host,
+            port=mcp_config.mcp_bind_port,
+            uvicorn_config={"timeout_graceful_shutdown": 5},
+            **({"middleware": [asgi_middleware]} if asgi_middleware else {}),
+            **({"stateless_http": True} if mcp_config.stateless_http else {})
+        )
     else:
         logger.info("Starting Prometheus MCP Server", transport=transport)
         # Run stdio transport in a thread so signal handlers can trigger graceful shutdown

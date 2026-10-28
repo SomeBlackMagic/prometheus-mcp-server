@@ -897,6 +897,7 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "docker" },
+    { name = "httpx" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -907,6 +908,7 @@ dev = [
 requires-dist = [
     { name = "docker", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "fastmcp", specifier = ">=3.1.0" },
+    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.24.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
